@@ -26,6 +26,16 @@ targets:
     info:
       path: GLBPreview/Info.plist
       properties:
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.khronos.glb
+            UTTypeDescription: GL Transmission Format Binary
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - glb
+              public.mime-type:
+                - model/gltf-binary
         CFBundleDocumentTypes:
           - CFBundleTypeName: GL Transmission Format Binary
             CFBundleTypeRole: Viewer
