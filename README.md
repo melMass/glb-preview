@@ -10,9 +10,9 @@ macOS Quick Look extension for previewing `.glb` (glTF Binary) files. Press spac
 - Spacebar preview of `.glb` files in Finder
 - Interactive 3D viewer (orbit, pan, zoom)
 - Draco mesh compression support
+- Render modes: lit (PBR), albedo, normals, UVs, wireframe
 - Animation playback with scrubber and pause
 - Auto-rotate toggle
-- Background colour toggle (dark/mid/light/white)
 - Camera reset
 - Thumbnail generation for Finder icons
 - Fully offline (no network required)
@@ -57,10 +57,10 @@ In Xcode:
 Then install:
 
 ```bash
-# Copy to Applications and reset Quick Look
+# Copy to Applications and reset Quick Look caches
 rm -rf /Applications/GLBPreview.app
 cp -R ~/Library/Developer/Xcode/DerivedData/GLBPreview-*/Build/Products/Debug/GLBPreview.app /Applications/
-qlmanage -r
+qlmanage -r && qlmanage -r cache
 ```
 
 Open the app once to register the extensions:
@@ -74,7 +74,7 @@ open /Applications/GLBPreview.app
 - Select a `.glb` file in Finder and press **Space** to preview
 - **Left-drag** to orbit
 - **Scroll** to zoom
-- Toolbar buttons (top right): background toggle, auto-rotate, camera reset
+- Toolbar buttons (top right): render mode (cycles lit/albedo/normal/uv/wire), auto-rotate, camera reset
 - Animation controls appear at the bottom when the model has animations
 
 ## Set as default app for .glb files
@@ -97,9 +97,60 @@ glb-preview/
     └── ThumbnailProvider.swift
 ```
 
-## TODO
+## Debugging Quick Look extensions
 
-- [ ] Fix ~1s delay on all button interactions in the preview. Likely caused by WKWebView event handling in the sandboxed Quick Look extension. Potential fix: move controls to native AppKit buttons overlaid on the web view.
+macOS has two Quick Look systems and the tooling is confusing:
+
+**Legacy system** (`qlmanage`, QL generator plugins): The old `.qlgenerator` bundle approach. `qlmanage -m plugins` only lists these — it will **not** show modern extension-based providers. Most online guides reference this system.
+
+**Modern system** (ExtensionKit, `pluginkit`): What this project uses — `com.apple.quicklook.preview` / `com.apple.quicklook.thumbnail` app extension points. Registered via the host app, managed by ExtensionKit.
+
+### Useful commands
+
+```bash
+# List registered QL preview extensions (modern system)
+pluginkit -m -p com.apple.quicklook.preview
+pluginkit -m -p com.apple.quicklook.thumbnail
+
+# Check what UTI macOS assigns to a file
+# If this shows "dyn.xxxxx" your UTImportedTypeDeclarations is missing/wrong
+mdls -name kMDItemContentType some_file.glb
+
+# Force-trigger a preview (works for both legacy and modern)
+qlmanage -p some_file.glb
+
+# Force-generate a thumbnail
+qlmanage -t some_file.glb -s 512
+
+# Reset QL caches (still needed after every rebuild)
+qlmanage -r && qlmanage -r cache
+
+# Console.app — filter for any of:
+#   "quicklook", "extensionkit", "com.laurie.GLBPreview", "PreviewExtension"
+```
+
+### Common pitfalls
+
+- **Extension shows in System Settings but doesn't trigger**: Almost always a UTI mismatch. The host app must declare `UTImportedTypeDeclarations` mapping `.glb` → `org.khronos.glb`, otherwise macOS assigns a dynamic UTI and the extension never matches.
+- **macOS caches aggressively**: Always `qlmanage -r` after rebuild. If truly stuck: `killall Finder`, or log out and back in.
+- **Sandbox blocks file access**: The extension runs sandboxed. It receives a security-scoped URL from QuickLook — call `url.startAccessingSecurityScopedResource()` if file reads fail silently.
+- **Code signing matters**: Unsigned or ad-hoc signed extensions may not load. Check Console for `extensionkit` errors.
+- **In-view buttons feel laggy (~1s)**: Use `pointerdown`, not `mousedown`/`click`, for controls inside the preview. The QL WKWebView synthesizes legacy mouse events with a gesture-disambiguation delay (~650 ms measured); pointer events bypass it entirely.
+
+### Viewer JS logging
+
+`PreviewViewController` bridges the web view's `console` (and uncaught errors / promise rejections) to the unified log, so the viewer's JS is observable without attaching a debugger:
+
+```bash
+# via the toolkit
+overlay use toolkit.nu
+watch-logs                # --level info by default
+
+# or directly
+log stream --predicate 'subsystem == "com.laurie.GLBPreview.PreviewExtension"' --level info
+```
+
+`console.error` → `.error`, `console.warn` → `.default`, `console.log`/`.info` → `.info`. Note `.info` messages need `--level info` to appear.
 
 ## Known limitations
 

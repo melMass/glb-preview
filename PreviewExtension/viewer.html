@@ -32,8 +32,8 @@
     border: 1px solid rgba(255,255,255,0.08);
   }
   .toolbar button {
-    width: 26px;
     height: 26px;
+    min-width: 26px;
     border-radius: 6px;
     border: none;
     cursor: pointer;
@@ -50,6 +50,14 @@
   .toolbar svg {
     width: 14px; height: 14px;
     fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round;
+  }
+  .toolbar .mode-btn {
+    padding: 0 7px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    font-family: -apple-system, sans-serif;
+    text-transform: uppercase;
   }
 
   .playback {
@@ -130,7 +138,7 @@
 <script type="module" src="model-viewer.min.js"></script>
 
 <div class="toolbar">
-  <button id="bgToggle" title="Toggle background">&#9681;</button>
+  <button id="modeToggle" class="mode-btn" title="Render mode: Lit">lit</button>
   <div class="sep"></div>
   <button id="rotateToggle" class="active" title="Auto-rotate">&#8635;</button>
   <div class="sep"></div>
@@ -166,11 +174,12 @@
 <div class="error" id="error" style="display:none;"></div>
 
 <script>
-  const backgrounds = ['#262626', '#808080', '#d9d9d9', '#ffffff'];
-  let bgIndex = 0;
+  const MODES = ['lit', 'albedo', 'normal', 'uv', 'wire'];
+  let modeIndex = 0;
   let autoRotate = true;
   let isPlaying = true;
   let isScrubbing = false;
+
   const viewer = document.getElementById('viewer');
   const errorEl = document.getElementById('error');
   const playback = document.getElementById('playback');
@@ -178,18 +187,127 @@
   const timeDisplay = document.getElementById('timeDisplay');
   const pauseIcon = document.getElementById('pauseIcon');
   const playIcon = document.getElementById('playIcon');
+  const modeBtn = document.getElementById('modeToggle');
 
-  // Use mousedown for all buttons - fires immediately on press
-  document.getElementById('bgToggle').addEventListener('mousedown', (e) => {
+  // --- Three.js scene access ---
+
+  let meshEntries = [];
+
+  function findSceneRoot() {
+    const model = viewer.model;
+    if (!model) return null;
+    for (const s of Object.getOwnPropertySymbols(model)) {
+      try {
+        const val = model[s];
+        if (val?.threeGLTF?.scene?.traverse) return val.threeGLTF.scene;
+        if (val?.traverse && val?.isObject3D) return val;
+      } catch {}
+    }
+    for (const s of Object.getOwnPropertySymbols(viewer)) {
+      try {
+        const val = viewer[s];
+        if (val?.isScene && val?.traverse) return val;
+      } catch {}
+    }
+    return null;
+  }
+
+  function collectMeshes() {
+    const root = findSceneRoot();
+    if (!root) return [];
+    const entries = [];
+    root.traverse(node => {
+      if (node.isMesh) {
+        entries.push({ mesh: node, orig: node.material });
+      }
+    });
+    return entries;
+  }
+
+  // --- Render modes (clone + reassign on meshes) ---
+
+  // The lighting-output chunk was renamed across Three.js versions.
+  const OUTPUT_CHUNKS = ['#include <opaque_fragment>', '#include <output_fragment>'];
+
+  function setFragOutput(shader, glsl) {
+    const target = OUTPUT_CHUNKS.find(c => shader.fragmentShader.includes(c));
+    if (target) shader.fragmentShader = shader.fragmentShader.replace(target, glsl);
+  }
+
+  // Inject our own varyings driven by stable attribute names (objectNormal, uv)
+
+  function albedoOverride() {
+    return (shader) => {
+      setFragOutput(shader, 'gl_FragColor = vec4( diffuseColor.rgb, 1.0 );');
+    };
+  }
+
+  function normalOverride() {
+    return (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vDbgNormal;')
+        .replace('#include <beginnormal_vertex>',
+          '#include <beginnormal_vertex>\nvDbgNormal = normalize( normalMatrix * objectNormal );');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vDbgNormal;');
+      setFragOutput(shader, 'gl_FragColor = vec4( normalize( vDbgNormal ) * 0.5 + 0.5, 1.0 );');
+    };
+  }
+
+  // macros (no legacy vUv/USE_UV), so drive the debug varying from the map channel.
+  function uvOverride() {
+    return (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec2 vDbgUv;')
+        .replace('#include <uv_vertex>',
+          '#include <uv_vertex>\n#ifdef USE_MAP\nvDbgUv = ( mapTransform * vec3( MAP_UV, 1 ) ).xy;\n#endif');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying vec2 vDbgUv;');
+      setFragOutput(shader,
+        '#ifdef USE_MAP\ngl_FragColor = vec4( fract( vDbgUv ), 0.0, 1.0 );\n#else\ngl_FragColor = vec4( 0.5, 0.5, 0.5, 1.0 );\n#endif');
+    };
+  }
+
+  const OVERRIDES = { albedo: albedoOverride, normal: normalOverride, uv: uvOverride };
+
+  function variantFor(entry, mode) {
+    if (mode === 'lit') return entry.orig;
+    entry.cache ??= {};
+    if (entry.cache[mode]) return entry.cache[mode];
+
+    const m = entry.orig.clone();
+    if (mode === 'wire') {
+      m.wireframe = true;
+    } else if (OVERRIDES[mode]) {
+      m.toneMapped = false;
+      m.onBeforeCompile = OVERRIDES[mode]();
+    }
+    entry.cache[mode] = m;
+    return m;
+  }
+
+  function applyMode(mode) {
+    if (!meshEntries.length) return;
+
+    for (const entry of meshEntries) {
+      entry.mesh.material = variantFor(entry, mode);
+    }
+
+    viewer.setAttribute('shadow-intensity', mode === 'lit' ? '0.5' : '0');
+    modeBtn.textContent = mode;
+    modeBtn.title = 'Render mode: ' + mode.charAt(0).toUpperCase() + mode.slice(1);
+  }
+
+  modeBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    bgIndex = (bgIndex + 1) % backgrounds.length;
-    const bg = backgrounds[bgIndex];
-    viewer.style.background = bg;
-    document.body.style.background = bg;
+    modeIndex = (modeIndex + 1) % MODES.length;
+    applyMode(MODES[modeIndex]);
   });
 
+  // --- Auto-rotate ---
+
   const rotateBtn = document.getElementById('rotateToggle');
-  rotateBtn.addEventListener('mousedown', (e) => {
+  rotateBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     autoRotate = !autoRotate;
     if (autoRotate) {
@@ -201,7 +319,9 @@
     }
   });
 
-  document.getElementById('resetCamera').addEventListener('mousedown', (e) => {
+  // --- Reset camera ---
+
+  document.getElementById('resetCamera').addEventListener('pointerdown', (e) => {
     e.preventDefault();
     viewer.cameraOrbit = 'auto auto auto';
     viewer.cameraTarget = 'auto auto auto';
@@ -209,7 +329,9 @@
     viewer.jumpCameraToGoal();
   });
 
-  document.getElementById('playPause').addEventListener('mousedown', (e) => {
+  // --- Animation playback ---
+
+  document.getElementById('playPause').addEventListener('pointerdown', (e) => {
     e.preventDefault();
     isPlaying = !isPlaying;
     if (isPlaying) {
@@ -223,7 +345,7 @@
     }
   });
 
-  scrubber.addEventListener('mousedown', () => { isScrubbing = true; });
+  scrubber.addEventListener('pointerdown', () => { isScrubbing = true; });
   scrubber.addEventListener('input', () => {
     const duration = viewer.duration;
     if (duration > 0) {
@@ -232,7 +354,7 @@
       timeDisplay.textContent = t.toFixed(1) + 's';
     }
   });
-  scrubber.addEventListener('mouseup', () => { isScrubbing = false; });
+  scrubber.addEventListener('pointerup', () => { isScrubbing = false; });
 
   function updatePlayback() {
     if (!isScrubbing && viewer.duration > 0) {
@@ -243,7 +365,11 @@
     requestAnimationFrame(updatePlayback);
   }
 
+  // --- Model load ---
+
   viewer.addEventListener('load', () => {
+    meshEntries = collectMeshes();
+
     if (viewer.availableAnimations && viewer.availableAnimations.length > 0) {
       playback.style.display = 'flex';
       requestAnimationFrame(updatePlayback);
@@ -254,6 +380,8 @@
     errorEl.textContent = 'Failed to load model';
     errorEl.style.display = 'block';
   });
+
+  // --- External model loading (from PreviewViewController) ---
 
   window.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'loadModel') {

@@ -1,16 +1,61 @@
 import Cocoa
 import QuickLookUI
 import WebKit
+import os.log
 
-class PreviewViewController: NSViewController, QLPreviewingController, WKNavigationDelegate {
+private let log = OSLog(subsystem: "com.laurie.GLBPreview.PreviewExtension", category: "viewer")
+
+// WKUserContentController retains its message handler strongly; a weak wrapper
+// breaks the controller → handler → viewController → webView → config cycle.
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var delegate: WKScriptMessageHandler?
+    init(_ delegate: WKScriptMessageHandler) { self.delegate = delegate }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        delegate?.userContentController(controller, didReceive: message)
+    }
+}
+
+class PreviewViewController: NSViewController, QLPreviewingController, WKNavigationDelegate, WKScriptMessageHandler {
 
     private var webView: WKWebView!
     private var pendingBase64: String?
     private var continuation: CheckedContinuation<Void, Error>?
 
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any], let msg = body["msg"] as? String else { return }
+        switch body["level"] as? String {
+        case "error": os_log("%{public}@", log: log, type: .error, msg)
+        case "warn": os_log("%{public}@", log: log, type: .default, msg)
+        default: os_log("%{public}@", log: log, type: .info, msg)
+        }
+    }
+
     override func loadView() {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        config.userContentController.add(WeakScriptMessageHandler(self), name: "log")
+
+        let consoleBridge = """
+        (function() {
+            function send(level, args) {
+                const msg = Array.from(args).map(a => {
+                    try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
+                    catch { return String(a); }
+                }).join(' ');
+                window.webkit?.messageHandlers?.log?.postMessage({ level, msg });
+            }
+            for (const level of ['log', 'info', 'warn', 'error']) {
+                const orig = console[level];
+                console[level] = function() { send(level, arguments); orig.apply(console, arguments); };
+            }
+            window.addEventListener('error', (e) => send('error', [`${e.message} @ ${e.filename}:${e.lineno}`]));
+            window.addEventListener('unhandledrejection', (e) => send('error', [`Unhandled rejection: ${e.reason}`]));
+        })();
+        """
+        config.userContentController.addUserScript(
+            WKUserScript(source: consoleBridge, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        )
+
         webView = WKWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
         webView.navigationDelegate = self
