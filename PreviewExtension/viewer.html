@@ -192,6 +192,17 @@
   // --- Three.js scene access ---
 
   let meshEntries = [];
+  let modelScene = null;
+
+  // model-viewer renders on demand; direct Three.js material swaps don't mark it
+  // dirty, so we wake it explicitly via the ModelScene's queueRender().
+  function findModelScene() {
+    for (const s of Object.getOwnPropertySymbols(viewer)) {
+      const v = viewer[s];
+      if (v?.isScene && typeof v.queueRender === 'function') return v;
+    }
+    return null;
+  }
 
   function findSceneRoot() {
     const model = viewer.model;
@@ -217,7 +228,7 @@
     if (!root) return [];
     const entries = [];
     root.traverse(node => {
-      if (node.isMesh) {
+      if (node.isMesh && node.material?.isMeshStandardMaterial) {
         entries.push({ mesh: node, orig: node.material });
       }
     });
@@ -296,12 +307,18 @@
     viewer.setAttribute('shadow-intensity', mode === 'lit' ? '0.5' : '0');
     modeBtn.textContent = mode;
     modeBtn.title = 'Render mode: ' + mode.charAt(0).toUpperCase() + mode.slice(1);
+    modelScene?.queueRender();
   }
+
+  function cycleMode() {
+    modeIndex = (modeIndex + 1) % MODES.length;
+    applyMode(MODES[modeIndex]);
+  }
+  window.glbCycleMode = cycleMode;
 
   modeBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    modeIndex = (modeIndex + 1) % MODES.length;
-    applyMode(MODES[modeIndex]);
+    cycleMode();
   });
 
   // --- Auto-rotate ---
@@ -369,6 +386,7 @@
 
   viewer.addEventListener('load', () => {
     meshEntries = collectMeshes();
+    modelScene = findModelScene();
 
     if (viewer.availableAnimations && viewer.availableAnimations.length > 0) {
       playback.style.display = 'flex';

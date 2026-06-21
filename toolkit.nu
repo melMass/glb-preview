@@ -14,6 +14,18 @@ export def watch-logs [--level: string@levels = "info"] {
   log stream --predicate 'subsystem == "com.laurie.GLBPreview.PreviewExtension"' --level $level
 }
 
+# Render a thumbnail via the registered extension (bypasses Finder cache) and open it
+export def thumb [file: path, --size: int = 512, --open (-o)] {
+  let result = (^swift ($here | path join tools thumb.swift) ($file | path expand) ($size | into string) | complete)
+  if $result.exit_code != 0 {
+    print $"(ansi red)($result.stderr | str trim)(ansi reset)"
+    return
+  }
+  let out = ($result.stdout | str trim)
+  print $"(ansi g)($out)(ansi reset)"
+  if $open { ^open $out }
+}
+
 # Headless build, install, and Quick Look reset for GLBPreview
 export def build [
   --release (-r) # Release configuration (default: Debug)
